@@ -1,4 +1,4 @@
-"""FastAPI application: ingest, timeline/sample/compare query and reset endpoints."""
+"""FastAPI application: ingest, timeline/sample/compare query, seal and reset endpoints."""
 
 from __future__ import annotations
 
@@ -21,7 +21,10 @@ from .engine import (
     evaluate_sample,
     evaluate_sensor_majority,
     find_sensor_events,
+    hash_seal_evidence,
     preview_submission,
+    revision_to_dict,
+    sealed_revision_list,
 )
 from .models import (
     BatchResult,
@@ -38,8 +41,19 @@ from .models import (
     ReleaseResponse,
     ResetResponse,
     SamplePointResponse,
+    SealRecordResponse,
+    SealRequest,
+    SealResponse,
+    SealedRevision,
 )
-from .storage import BatchStore, EventStore, IdempotencyConflict, StoredEvent
+from .storage import (
+    BatchStore,
+    EventStore,
+    IdempotencyConflict,
+    SealConflict,
+    SealRecord,
+    StoredEvent,
+)
 
 logger = logging.getLogger("calibration")
 
@@ -80,6 +94,19 @@ async def conflict_handler(_: Request, exc: IdempotencyConflict) -> JSONResponse
             "detail": (
                 f"idempotency_key {exc.args[0]!r} was already used with a "
                 "different event payload"
+            )
+        },
+    )
+
+
+@app.exception_handler(SealConflict)
+async def seal_conflict_handler(_: Request, exc: SealConflict) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": (
+                f"seal_id {exc.args[0]!r} was already used with different "
+                "request parameters"
             )
         },
     )
@@ -411,20 +438,139 @@ def sensor_majority(batch_id: str, query: MajorityRequest) -> MajorityResponse:
 
 
 @app.post(
+    "/api/v1/batches/{batch_id}/seals",
+    response_model=SealResponse,
+    status_code=200,
+    tags=["calibration"],
+    summary="Seal a complete batch into an immutable evidence archive",
+    responses={
+        404: {"description": "Unknown batch"},
+        409: {"description": "Batch incomplete, hash mismatch or seal conflict"},
+    },
+)
+def create_seal(batch_id: str, request: SealRequest) -> SealResponse:
+    if request.batch_id != batch_id:
+        raise HTTPException(
+            status_code=422,
+            detail="batch_id in path and body must match",
+        )
+    # One lock acquisition for the whole decision + snapshot: replay
+    # detection, completeness and hash verification and the archived fold all
+    # observe one consistent batch snapshot.
+    with store.lock:
+        existing = store.get_seal(batch_id, request.seal_id)
+        if existing is not None:
+            if existing.timeline_hash != request.timeline_hash:
+                raise SealConflict(request.seal_id)
+            # Exact replay: return the original snapshot even though the live
+            # batch may have moved on since the seal was created.
+            return _seal_response("duplicate", existing)
+        batch = store.get_batch(batch_id)
+        if batch is None or not batch.events:
+            raise HTTPException(
+                status_code=404, detail=f"batch {batch_id!r} not found"
+            )
+        result = evaluate_batch(batch_id, batch)
+        if not result["complete"]:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"batch {batch_id!r} is not complete: blocked or invalid "
+                    "revisions remain"
+                ),
+            )
+        if result["timeline_hash"] != request.timeline_hash:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "timeline_hash does not match the current batch snapshot; "
+                    "the batch has changed since the hash was obtained"
+                ),
+            )
+        record = SealRecord(
+            batch_id=batch_id,
+            seal_id=request.seal_id,
+            timeline_hash=result["timeline_hash"],
+            evidence_digest=hash_seal_evidence(
+                sealed_revision_list(batch), result
+            ),
+            revisions=tuple(sealed_revision_list(batch)),
+            result=result,
+        )
+        store.put_seal(record)
+    return _seal_response("sealed", record)
+
+
+def _seal_response(status: str, record: SealRecord) -> SealResponse:
+    return SealResponse(
+        status=status,
+        batch_id=record.batch_id,
+        seal_id=record.seal_id,
+        timeline_hash=record.timeline_hash,
+        evidence_digest=record.evidence_digest,
+        revisions=[
+            SealedRevision(**revision_to_dict(event))
+            for event in record.revisions
+        ],
+        result=BatchResult(**record.result),
+    )
+
+
+@app.get(
+    "/api/v1/batches/{batch_id}/seals/{seal_id}",
+    response_model=SealRecordResponse,
+    tags=["calibration"],
+    summary="Look up a sealed batch archive and its live consistency",
+    responses={404: {"description": "Unknown seal"}},
+)
+def get_seal(batch_id: str, seal_id: str) -> SealRecordResponse:
+    with store.lock:
+        record = store.get_seal(batch_id, seal_id)
+        if record is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"seal {seal_id!r} not found in batch {batch_id!r}",
+            )
+        # A seal outlives no reset, so its batch is always still present;
+        # re-evaluate the live evidence to report whether it still matches.
+        batch = store.get_batch(batch_id)
+        current_result = evaluate_batch(batch_id, batch)
+        current_digest = hash_seal_evidence(
+            sealed_revision_list(batch), current_result
+        )
+    return SealRecordResponse(
+        batch_id=record.batch_id,
+        seal_id=record.seal_id,
+        timeline_hash=record.timeline_hash,
+        evidence_digest=record.evidence_digest,
+        revisions=[
+            SealedRevision(**revision_to_dict(event))
+            for event in record.revisions
+        ],
+        result=BatchResult(**record.result),
+        current_timeline_hash=current_result["timeline_hash"],
+        current_evidence_digest=current_digest,
+        current_consistent=current_digest == record.evidence_digest,
+    )
+
+
+@app.post(
     "/admin/reset",
     response_model=ResetResponse,
     tags=["ops"],
     summary="Clear all in-memory state",
 )
 def reset_state() -> ResetResponse:
-    batches_removed, events_removed = store.reset()
+    batches_removed, events_removed, seals_removed = store.reset()
     logger.warning(
-        "in-memory state reset: removed %d events across %d batches",
+        "in-memory state reset: removed %d events across %d batches and %d seals",
         events_removed,
         batches_removed,
+        seals_removed,
     )
     return ResetResponse(
         status="reset",
         batches_removed=batches_removed,
         events_removed=events_removed,
+        seals_removed=seals_removed,
     )

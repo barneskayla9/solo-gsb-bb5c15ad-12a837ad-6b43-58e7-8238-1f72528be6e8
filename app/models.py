@@ -16,6 +16,7 @@ VersionId = Annotated[str, Field(min_length=1, max_length=200)]
 BatchId = Annotated[str, Field(min_length=1, max_length=200)]
 SensorId = Annotated[str, Field(min_length=1, max_length=200)]
 IdemKey = Annotated[str, Field(min_length=1, max_length=200)]
+SealId = Annotated[str, Field(min_length=1, max_length=200)]
 UnitName = Annotated[str, Field(min_length=1, max_length=40)]
 
 
@@ -533,6 +534,76 @@ class MajorityResponse(StrictModel):
     input_hash: str
 
 
+# ---------------------------------------------------------------------------
+# Batch sealing (immutable factory-archive evidence)
+# ---------------------------------------------------------------------------
+
+
+class SealRequest(StrictModel):
+    """Parameters of one batch-seal request.
+
+    ``timeline_hash`` is the batch hash the caller obtained earlier (from an
+    ingest response or the result endpoint); the seal is created only when it
+    still matches the batch snapshot evaluated inside the same lock and the
+    batch is complete.
+    """
+
+    batch_id: BatchId
+    seal_id: SealId
+    # SHA-256 hex digest previously observed for this batch.
+    timeline_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class SealedRevision(StrictModel):
+    """One revision archived in a seal, echoed in deterministic order."""
+
+    sensor_id: str
+    revision_id: str
+    parent_id: str
+    start_ns: int
+    end_ns: int
+    # Null on withdrawn (tombstone) revisions.
+    value: Optional[float] = None
+    unit: Optional[str] = None
+    withdrawn: bool
+
+
+class SealResponse(StrictModel):
+    """Result of a seal request; a replayed request returns the stored seal."""
+
+    # sealed:    the archive snapshot was created by this request;
+    # duplicate: the same seal_id with the same timeline_hash already existed
+    #            and the original snapshot is returned unchanged.
+    status: Literal["sealed", "duplicate"]
+    batch_id: str
+    seal_id: str
+    # Batch timeline hash verified at seal time.
+    timeline_hash: str
+    # SHA-256 over the archived revisions plus the folded result.
+    evidence_digest: str
+    # Every revision of the batch at seal time (sorted by sensor/revision).
+    revisions: list[SealedRevision]
+    # Folded batch result evaluated on the sealed snapshot.
+    result: BatchResult
+
+
+class SealRecordResponse(StrictModel):
+    """Archived seal evidence plus its consistency with the live batch."""
+
+    batch_id: str
+    seal_id: str
+    timeline_hash: str
+    evidence_digest: str
+    revisions: list[SealedRevision]
+    result: BatchResult
+    # Live batch evidence re-evaluated at lookup time; later submissions
+    # change these but never rewrite the archived fields above.
+    current_timeline_hash: str
+    current_evidence_digest: str
+    # True when the live batch evidence still equals the sealed evidence.
+    current_consistent: bool
+
+
 class IngestResponse(StrictModel):
     status: Literal["accepted", "duplicate", "conflict"]
     idempotency_key: str
@@ -589,6 +660,7 @@ class ResetResponse(StrictModel):
     status: Literal["reset"]
     batches_removed: int
     events_removed: int
+    seals_removed: int
 
 
 class HealthResponse(StrictModel):

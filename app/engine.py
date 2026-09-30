@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .models import ROOT_PARENT
-from .storage import BatchStore, StoredEvent
+from .storage import BatchStore, StoredEvent, canonical_event
 # Revision states (reachable from a known root vs. waiting on a missing
 # ancestor vs. structurally unusable, e.g. part of a parent cycle).
 GROUNDED = "grounded"
@@ -1545,3 +1545,49 @@ def _majority_signature(span: dict) -> tuple:
         ),
         tuple(span["missing_ancestors"]),
     )
+
+
+# ---------------------------------------------------------------------------
+# Batch sealing (immutable factory-archive evidence)
+# ---------------------------------------------------------------------------
+
+
+def sealed_revision_list(store: BatchStore) -> list[StoredEvent]:
+    """Every stored revision of the batch, in deterministic order."""
+    return sorted(
+        store.events.values(), key=lambda e: (e.sensor_id, e.revision_id)
+    )
+
+
+def revision_to_dict(event: StoredEvent) -> dict:
+    """Canonical output form of one archived revision (no idempotency key)."""
+    return {
+        "sensor_id": event.sensor_id,
+        "revision_id": event.revision_id,
+        "parent_id": event.parent_id,
+        "start_ns": event.start_ns,
+        "end_ns": event.end_ns,
+        "value": None if event.value is None else float(event.value),
+        "unit": event.unit,
+        "withdrawn": event.withdrawn,
+    }
+
+
+def hash_seal_evidence(revisions: list[StoredEvent], result: dict) -> str:
+    """Stable SHA-256 over one seal's archived evidence.
+
+    Covers the canonical form of every archived revision plus the folded
+    batch-result document, so the digest changes exactly when the sealed
+    evidence changes; it is independent of arrival order and idempotency
+    keys, exactly like the batch ``timeline_hash``.
+    """
+    payload = json.dumps(
+        {
+            "revisions": sorted(canonical_event(e) for e in revisions),
+            "result": result,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()

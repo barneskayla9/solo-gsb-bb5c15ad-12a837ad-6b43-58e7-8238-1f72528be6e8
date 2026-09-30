@@ -35,6 +35,10 @@ class IdempotencyConflict(Exception):
     """An idempotency key was reused with a different payload."""
 
 
+class SealConflict(Exception):
+    """A seal id was reused with different request parameters."""
+
+
 @dataclass(frozen=True)
 class StoredEvent:
     batch_id: str
@@ -58,12 +62,31 @@ class BatchStore:
     idempotency: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class SealRecord:
+    """Immutable archive of one batch, frozen at seal time.
+
+    ``revisions`` is the deterministic snapshot of every stored revision and
+    ``result`` the folded batch-result document evaluated on that snapshot;
+    ``evidence_digest`` covers both. Later submissions never mutate a record.
+    """
+
+    batch_id: str
+    seal_id: str
+    timeline_hash: str
+    evidence_digest: str
+    revisions: tuple[StoredEvent, ...]
+    result: dict
+
+
 class EventStore:
     """Thread-safe, process-local, resettable event store."""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._batches: dict[str, BatchStore] = defaultdict(BatchStore)
+        # batch_id -> seal_id -> immutable archived snapshot
+        self._seals: dict[str, dict[str, SealRecord]] = defaultdict(dict)
 
     @property
     def lock(self) -> threading.RLock:
@@ -131,12 +154,24 @@ class EventStore:
 
             return "submittable"
 
-    def reset(self) -> tuple[int, int]:
+    def reset(self) -> tuple[int, int, int]:
         with self._lock:
             batches_removed = len(self._batches)
             events_removed = sum(len(b.events) for b in self._batches.values())
+            seals_removed = sum(len(s) for s in self._seals.values())
             self._batches.clear()
-            return batches_removed, events_removed
+            self._seals.clear()
+            return batches_removed, events_removed, seals_removed
+
+    # -- seals ----------------------------------------------------------------
+
+    def get_seal(self, batch_id: str, seal_id: str) -> Optional[SealRecord]:
+        with self._lock:
+            return self._seals.get(batch_id, {}).get(seal_id)
+
+    def put_seal(self, record: SealRecord) -> None:
+        with self._lock:
+            self._seals[record.batch_id][record.seal_id] = record
 
     # -- reads --------------------------------------------------------------
 
