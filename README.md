@@ -9,8 +9,10 @@
 **差异对比审计（compare）**，对单个传感器的折叠时间线做
 **质量门禁评估（quality gate）**，以及在指定半开时段内判断
 **全部必需传感器何时同时满足标定条件的设备放行评估（release）**，以及对
-**一组冗余传感器**做**可信多数投票（majority）**。
-全部状态保存在**进程内存**中，可随时重置。
+**一组冗余传感器**做**可信多数投票（majority）**。出厂留档时还可把
+**已完成批次封存（seal）**为一份不可改写的证据快照：冻结当时全部修订与
+折叠结果并生成确定性证据摘要，之后可随时回查并核对实时批次是否仍与封存
+一致。全部状态保存在**进程内存**中，可随时重置。
 
 ---
 
@@ -161,6 +163,18 @@ pytest -q
     即 `pending_backfill`，否则 `unqualified`。成环（invalid）修订不参与。
     响应中的 `input_hash` 是对各传感器扫描输入（折叠片段 + blocked 跨度）
     的 SHA-256：快照输入不变则哈希不变，与窗口、单位、`q` 和阈值无关。
+- **批次封存**（见 4.9）把已完成批次固定为一份可复核的出厂留档证据。
+  封存请求携带批次号、调用方自定义的**封存号**以及调用方先前取得的
+  `timeline_hash`；在**同一次加锁的同一批次快照**内核对哈希且批次
+  `complete=true`（无 blocked/invalid 修订）后，冻结**当时全部修订**
+  （按 `(sensor_id, revision_id)` 排序的完整记录）与**折叠结果**，并生成
+  覆盖两者的确定性 SHA-256 **证据摘要**（`evidence_digest`，与修订到达
+  顺序无关）。相同批次下相同封存号 + 相同请求的重放返回**原快照**
+  （`status="duplicate"`，即使实时批次已变化）；封存号相同但参数不同
+  → `409`；批次不存在 → `404`；哈希已变化或仍有 blocked/invalid 修订
+  → `409`，且**不留下任何封存记录**。封存后到达的修订只改变实时结果，
+  **不能改写旧封存**；回查（见 4.10）返回冻结证据、摘要，并用当前批次
+  重算证据摘要给出 `consistent`（实时证据是否仍与封存一致）。
 
 ---
 
@@ -707,9 +721,101 @@ $ curl -s -X POST localhost:8080/api/v1/batches/B42/majority \
 `S1`），S2/S3 以 `value_divergent` 列入 `non_voting_sensors` 并各自带回
 观测值。
 
+### `POST /api/v1/batches/{batch_id}/seals` — 封存批次（出厂留档证据）
+
+把**已完成**批次固定为一份不可改写的证据快照，用于出厂留档与事后复核。
+请求体：
+
+```json
+{
+  "batch_id": "B42",
+  "seal_id": "SEAL-2026-001",
+  "timeline_hash": "a7825f6b…fc9d73"
+}
+```
+
+参数说明：
+
+- `seal_id`：调用方自定义的封存号，在批次内唯一；
+- `timeline_hash`：调用方先前从批次结果取得的整批哈希（64 位小写十六
+  进制 SHA-256，格式非法返回 `422`）。路径 `batch_id` 必须与请求体一致。
+
+判定（全部在同一次加锁内的同一批次快照上完成）：
+
+- 该封存号已存在且请求与原始封存请求**完全相同** → `200`，
+  `status="duplicate"`，返回**原快照**（即使实时批次此后已变化）；
+- 该封存号已存在但参数不同 → `409`；
+- 批次不存在 → `404`；
+- 当前批次 `timeline_hash` 与请求不符（哈希已变化）→ `409`；
+- 批次仍有 blocked/invalid 修订（`complete=false`）→ `409`；
+- 以上任何拒绝都**不留下封存记录**；
+- 否则冻结证据并返回 `200`、`status="sealed"`。
+
+响应字段：
+
+- `timeline_hash`：封存时核验的批次哈希（请求回显）；
+- `evidence_digest`：覆盖**全部冻结修订 + 折叠结果**的确定性 SHA-256
+  证据摘要（修订按 `(sensor_id, revision_id)` 排序，与到达顺序无关）；
+- `evidence`：冻结的证据本体——`revisions`（当时全部修订的完整记录，
+  含 `parent_id`/`idempotency_key`/区间/值/单位/撤回标记）与 `result`
+  （封存时刻的完整批次结果，口径与 `GET /result` 一致）。
+
+### `GET /api/v1/batches/{batch_id}/seals/{seal_id}` — 回查封存证据
+
+返回封存时冻结的 `evidence` 与 `evidence_digest`，并用**当前**批次状态
+重算证据摘要：
+
+- `current_evidence_digest`：按当前全部修订与折叠结果重算的证据摘要
+  （批次不存在时为 `null`）；
+- `consistent`：当前证据摘要是否仍与封存摘要一致。封存后任何新修订
+  （即使是不改变折叠结果的 blocked 修订）都会使实时证据摘要变化、
+  `consistent` 变为 `false`，但**冻结的封存内容永不被改写**。
+
+封存号不存在返回 `404`。
+
+示例（B42 已 complete，先用结果哈希封存，随后新修订到达再回查）：
+
+```bash
+$ HASH=$(curl -s localhost:8080/api/v1/batches/B42/result | jq -r .timeline_hash)
+$ curl -s -X POST localhost:8080/api/v1/batches/B42/seals \
+    -H 'Content-Type: application/json' \
+    -d "{\"batch_id\":\"B42\",\"seal_id\":\"SEAL-2026-001\",\"timeline_hash\":\"$HASH\"}"
+{
+  "status": "sealed",
+  "batch_id": "B42",
+  "seal_id": "SEAL-2026-001",
+  "timeline_hash": "a7825f6b…fc9d73",
+  "evidence_digest": "e4f303ee…cdde1c",
+  "evidence": {
+    "batch_id": "B42",
+    "revisions": [
+      {"sensor_id": "S1", "revision_id": "v1", "parent_id": "ROOT",
+       "idempotency_key": "e1", "start_ns": 0, "end_ns": 300,
+       "value": 1.0, "unit": "C", "withdrawn": false},
+      {"sensor_id": "S1", "revision_id": "v2", "parent_id": "v1",
+       "idempotency_key": "e2", "start_ns": 100, "end_ns": 200,
+       "value": 3.5, "unit": "C", "withdrawn": false}
+    ],
+    "result": { … "complete": true, "timeline_hash": "a7825f6b…fc9d73" }
+  }
+}
+# 重放同一请求 -> "status":"duplicate"，返回同一份原快照
+# 新修订 v3 到达后回查：
+$ curl -s localhost:8080/api/v1/batches/B42/seals/SEAL-2026-001
+{
+  "batch_id": "B42",
+  "seal_id": "SEAL-2026-001",
+  "evidence_digest": "e4f303ee…cdde1c",
+  "evidence": { …同上，仍只有 v1/v2… },
+  "current_evidence_digest": "974f080c…",
+  "consistent": false
+}
+```
+
 ### `POST /admin/reset` — 清空全部内存状态
 
-返回被清除的批次数与事件数。
+返回被清除的批次数、事件数与封存数（`seals_removed`）；封存记录随重置
+一并清除。
 
 ### `GET /health` — 存活检查
 
@@ -782,7 +888,19 @@ curl -s -X POST localhost:8080/api/v1/batches/B42/majority \
        "expected_unit":"C","q":2,"max_value_difference":0.5}'
 #   -> status=qualified/pending_backfill/unqualified；intervals 恰好覆盖
 #      [0,300)，每段给 verdict、members、non_voting_sensors、missing_ancestors
+
+# 8) 出厂留档：批次 complete=true 后用当前 timeline_hash 封存；
+#    重放同一请求返回原快照，后续修订不改写封存，回查可核对一致性
+HASH=$(curl -s localhost:8080/api/v1/batches/B42/result | jq -r .timeline_hash)
+curl -s -X POST localhost:8080/api/v1/batches/B42/seals \
+  -H 'Content-Type: application/json' \
+  -d "{\"batch_id\":\"B42\",\"seal_id\":\"SEAL-2026-001\",\"timeline_hash\":\"$HASH\"}"
+#   -> status="sealed"，evidence 冻结当时全部修订与折叠结果，
+#      evidence_digest 为覆盖两者的确定性 SHA-256 摘要
+curl -s localhost:8080/api/v1/batches/B42/seals/SEAL-2026-001
+#   -> 返回冻结证据与摘要；consistent 表示实时批次证据是否仍与封存一致
 curl -s -X POST localhost:8080/admin/reset
+#   -> 连同封存记录一并清除（seals_removed）
 ```
 
 撤回某一段（墓碑，区间内被擦除）：
@@ -802,12 +920,12 @@ curl -s -X POST localhost:8080/admin/reset
 ```
 .
 ├── app/
-│   ├── main.py       # FastAPI 路由：ingest / preview / result / sample / compare / quality-gate / release / majority / reset / health
-│   ├── engine.py     # 因果分类、区间切分折叠、预览影响计算、采样点查询、跨批次差异对比、质量门禁扫描、设备放行扫描、冗余传感器可信多数投票、缺口与哈希（纯函数引擎）
-│   ├── storage.py    # 线程安全的内存存储、幂等判定与无副作用的提交预览判定
+│   ├── main.py       # FastAPI 路由：ingest / preview / result / sample / compare / quality-gate / release / majority / seals / reset / health
+│   ├── engine.py     # 因果分类、区间切分折叠、预览影响计算、采样点查询、跨批次差异对比、质量门禁扫描、设备放行扫描、冗余传感器可信多数投票、批次封存证据与摘要、缺口与哈希（纯函数引擎）
+│   ├── storage.py    # 线程安全的内存存储、幂等判定、无副作用的提交预览判定与不可改写封存记录
 │   ├── models.py     # Pydantic 请求/响应模型与校验
 │   └── config.py     # CAL_ 前缀环境变量配置
-├── tests/            # pytest（API 端到端 + 引擎单测，共 165 个用例）
+├── tests/            # pytest（API 端到端 + 引擎单测，共 188 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

@@ -17,6 +17,9 @@ BatchId = Annotated[str, Field(min_length=1, max_length=200)]
 SensorId = Annotated[str, Field(min_length=1, max_length=200)]
 IdemKey = Annotated[str, Field(min_length=1, max_length=200)]
 UnitName = Annotated[str, Field(min_length=1, max_length=40)]
+SealId = Annotated[str, Field(min_length=1, max_length=200)]
+# SHA-256 hex digest, exactly as emitted in a batch result's timeline_hash.
+TimelineHash = Annotated[str, Field(pattern="^[0-9a-f]{64}$")]
 
 
 class StrictModel(BaseModel):
@@ -585,10 +588,88 @@ class PreviewResponse(StrictModel):
     gaps_removed: list[Gap] = Field(default_factory=list)
 
 
+# ---------------------------------------------------------------------------
+# Batch sealing (immutable archival evidence)
+# ---------------------------------------------------------------------------
+
+
+class SealRequest(StrictModel):
+    """Parameters of one batch-seal request.
+
+    The caller supplies the ``timeline_hash`` obtained from an earlier batch
+    result; the seal is created only when the batch still evaluates to that
+    exact hash and is complete (no blocked or invalid revisions), both
+    checked against one consistent batch snapshot.
+    """
+
+    batch_id: BatchId
+    # Caller-chosen seal identifier, unique per batch.
+    seal_id: SealId
+    # Batch timeline hash the caller verified before sealing.
+    timeline_hash: TimelineHash
+
+
+class SealedRevision(StrictModel):
+    """One stored revision frozen into a seal's evidence."""
+
+    sensor_id: str
+    revision_id: str
+    parent_id: str
+    idempotency_key: str
+    start_ns: int
+    end_ns: int
+    # Populated for value-bearing revisions; null on withdrawn tombstones.
+    value: Optional[float] = None
+    unit: Optional[str] = None
+    withdrawn: bool
+
+
+class SealEvidence(StrictModel):
+    """Immutable snapshot frozen by a seal: all revisions + folded result."""
+
+    batch_id: str
+    # Every revision stored at seal time, sorted by (sensor_id, revision_id).
+    revisions: list[SealedRevision]
+    # The deterministic batch result evaluated at seal time.
+    result: BatchResult
+
+
+class SealResponse(StrictModel):
+    """Result of a seal request (newly sealed or an exact replay)."""
+
+    # sealed:    the seal was created by this request;
+    # duplicate: an identical request was already sealed; the original
+    #            snapshot is returned unchanged.
+    status: Literal["sealed", "duplicate"]
+    batch_id: str
+    seal_id: str
+    # Batch timeline hash verified at seal time (echo of the request).
+    timeline_hash: str
+    # SHA-256 over the frozen evidence (all revisions + folded result).
+    evidence_digest: str
+    evidence: SealEvidence
+
+
+class SealRecallResponse(StrictModel):
+    """A stored seal plus whether the live batch still matches it."""
+
+    batch_id: str
+    seal_id: str
+    # SHA-256 over the frozen evidence (all revisions + folded result).
+    evidence_digest: str
+    evidence: SealEvidence
+    # Digest recomputed over the batch's current revisions + folded result;
+    # null when the batch no longer exists.
+    current_evidence_digest: Optional[str] = None
+    # True when the live batch evidence is still identical to the sealed one.
+    consistent: bool
+
+
 class ResetResponse(StrictModel):
     status: Literal["reset"]
     batches_removed: int
     events_removed: int
+    seals_removed: int
 
 
 class HealthResponse(StrictModel):

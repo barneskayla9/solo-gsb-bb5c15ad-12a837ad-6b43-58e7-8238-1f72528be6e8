@@ -1,4 +1,4 @@
-"""FastAPI application: ingest, timeline/sample/compare query and reset endpoints."""
+"""FastAPI application: ingest, preview, query, evaluation, seal and reset endpoints."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from . import __version__
 from .config import get_settings
 from .engine import (
     ReleaseRequirement,
+    build_seal_evidence,
     compare_sensor,
     evaluate_batch,
     evaluate_device_release,
@@ -21,6 +22,7 @@ from .engine import (
     evaluate_sample,
     evaluate_sensor_majority,
     find_sensor_events,
+    hash_seal_evidence,
     preview_submission,
 )
 from .models import (
@@ -38,8 +40,12 @@ from .models import (
     ReleaseResponse,
     ResetResponse,
     SamplePointResponse,
+    SealEvidence,
+    SealRecallResponse,
+    SealRequest,
+    SealResponse,
 )
-from .storage import BatchStore, EventStore, IdempotencyConflict, StoredEvent
+from .storage import BatchStore, EventStore, IdempotencyConflict, SealRecord, StoredEvent
 
 logger = logging.getLogger("calibration")
 
@@ -410,6 +416,118 @@ def sensor_majority(batch_id: str, query: MajorityRequest) -> MajorityResponse:
     return MajorityResponse(**doc)
 
 
+def _seal_response(status: str, record: SealRecord) -> SealResponse:
+    return SealResponse(
+        status=status,
+        batch_id=record.batch_id,
+        seal_id=record.seal_id,
+        timeline_hash=record.timeline_hash,
+        evidence_digest=record.evidence_digest,
+        evidence=SealEvidence(**record.evidence),
+    )
+
+
+@app.post(
+    "/api/v1/batches/{batch_id}/seals",
+    response_model=SealResponse,
+    status_code=200,
+    tags=["calibration"],
+    summary="Seal a complete batch into immutable archival evidence",
+    responses={
+        404: {"description": "Unknown batch"},
+        409: {"description": "Seal id reused, stale hash, or incomplete batch"},
+    },
+)
+def seal_batch(batch_id: str, request: SealRequest) -> SealResponse:
+    if request.batch_id != batch_id:
+        raise HTTPException(
+            status_code=422,
+            detail="batch_id in path and body must match",
+        )
+    # One lock acquisition for the whole decision + snapshot: the replay
+    # check, the hash/completeness validation and the evidence capture all
+    # observe one consistent batch snapshot.
+    with store.lock:
+        existing = store.get_seal(batch_id, request.seal_id)
+        if existing is not None:
+            if existing.timeline_hash == request.timeline_hash:
+                # Exact replay of the original request: return the frozen
+                # snapshot, even if the live batch has moved on since.
+                return _seal_response("duplicate", existing)
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"seal {request.seal_id!r} already exists for batch "
+                    f"{batch_id!r} with a different request"
+                ),
+            )
+        batch = store.get_batch(batch_id)
+        if batch is None or not batch.events:
+            raise HTTPException(
+                status_code=404, detail=f"batch {batch_id!r} not found"
+            )
+        evidence = build_seal_evidence(batch_id, batch)
+        result = evidence["result"]
+        if result["timeline_hash"] != request.timeline_hash:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"timeline_hash {request.timeline_hash!r} does not match "
+                    f"the current batch hash {result['timeline_hash']!r}; "
+                    "re-read the batch result and retry"
+                ),
+            )
+        if not result["complete"]:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"batch {batch_id!r} is not complete: "
+                    f"{result['revisions_blocked']} blocked and "
+                    f"{result['revisions_invalid']} invalid revision(s) remain"
+                ),
+            )
+        record = SealRecord(
+            batch_id=batch_id,
+            seal_id=request.seal_id,
+            timeline_hash=request.timeline_hash,
+            evidence=evidence,
+            evidence_digest=hash_seal_evidence(evidence),
+        )
+        store.add_seal(record)
+    return _seal_response("sealed", record)
+
+
+@app.get(
+    "/api/v1/batches/{batch_id}/seals/{seal_id}",
+    response_model=SealRecallResponse,
+    tags=["calibration"],
+    summary="Recall a sealed batch snapshot and check it against the live batch",
+    responses={404: {"description": "Unknown batch or seal"}},
+)
+def recall_seal(batch_id: str, seal_id: str) -> SealRecallResponse:
+    with store.lock:
+        record = store.get_seal(batch_id, seal_id)
+        if record is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"seal {seal_id!r} not found for batch {batch_id!r}",
+            )
+        batch = store.get_batch(batch_id)
+        current_digest = (
+            hash_seal_evidence(build_seal_evidence(batch_id, batch))
+            if batch is not None and batch.events
+            else None
+        )
+    return SealRecallResponse(
+        batch_id=record.batch_id,
+        seal_id=record.seal_id,
+        evidence_digest=record.evidence_digest,
+        evidence=SealEvidence(**record.evidence),
+        current_evidence_digest=current_digest,
+        consistent=current_digest == record.evidence_digest,
+    )
+
+
 @app.post(
     "/admin/reset",
     response_model=ResetResponse,
@@ -417,14 +535,16 @@ def sensor_majority(batch_id: str, query: MajorityRequest) -> MajorityResponse:
     summary="Clear all in-memory state",
 )
 def reset_state() -> ResetResponse:
-    batches_removed, events_removed = store.reset()
+    batches_removed, events_removed, seals_removed = store.reset()
     logger.warning(
-        "in-memory state reset: removed %d events across %d batches",
+        "in-memory state reset: removed %d events across %d batches and %d seals",
         events_removed,
         batches_removed,
+        seals_removed,
     )
     return ResetResponse(
         status="reset",
         batches_removed=batches_removed,
         events_removed=events_removed,
+        seals_removed=seals_removed,
     )

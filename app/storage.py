@@ -58,12 +58,31 @@ class BatchStore:
     idempotency: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class SealRecord:
+    """One immutable batch seal: frozen evidence plus its deterministic digest.
+
+    The evidence dict is a plain-data snapshot (all revisions at seal time
+    plus the folded batch result) fully decoupled from the live store, so
+    later submissions can never rewrite a stored seal.
+    """
+
+    batch_id: str
+    seal_id: str
+    # timeline_hash supplied by the original sealing request.
+    timeline_hash: str
+    evidence: dict
+    evidence_digest: str
+
+
 class EventStore:
     """Thread-safe, process-local, resettable event store."""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._batches: dict[str, BatchStore] = defaultdict(BatchStore)
+        # batch_id -> seal_id -> frozen archival evidence
+        self._seals: dict[str, dict[str, SealRecord]] = defaultdict(dict)
 
     @property
     def lock(self) -> threading.RLock:
@@ -131,12 +150,24 @@ class EventStore:
 
             return "submittable"
 
-    def reset(self) -> tuple[int, int]:
+    def reset(self) -> tuple[int, int, int]:
         with self._lock:
             batches_removed = len(self._batches)
             events_removed = sum(len(b.events) for b in self._batches.values())
+            seals_removed = sum(len(s) for s in self._seals.values())
             self._batches.clear()
-            return batches_removed, events_removed
+            self._seals.clear()
+            return batches_removed, events_removed, seals_removed
+
+    # -- seals --------------------------------------------------------------
+
+    def get_seal(self, batch_id: str, seal_id: str) -> Optional[SealRecord]:
+        with self._lock:
+            return self._seals.get(batch_id, {}).get(seal_id)
+
+    def add_seal(self, record: SealRecord) -> None:
+        with self._lock:
+            self._seals[record.batch_id][record.seal_id] = record
 
     # -- reads --------------------------------------------------------------
 

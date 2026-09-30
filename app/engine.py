@@ -1,8 +1,9 @@
 """Deterministic effective-calibration-timeline engine.
 
 The engine is pure: given a :class:`~app.storage.BatchStore` snapshot it
-produces per-sensor timelines, backfillable gaps, content hashes and
-cross-batch diffs, without keeping state of its own.
+produces per-sensor timelines, backfillable gaps, content hashes,
+cross-batch diffs and archival seal evidence, without keeping state of its
+own.
 """
 
 from __future__ import annotations
@@ -1545,3 +1546,56 @@ def _majority_signature(span: dict) -> tuple:
         ),
         tuple(span["missing_ancestors"]),
     )
+
+
+# ---------------------------------------------------------------------------
+# Batch sealing (immutable archival evidence)
+# ---------------------------------------------------------------------------
+
+
+def revision_to_dict(event: StoredEvent) -> dict:
+    """Plain-data snapshot of one stored revision, for seal evidence."""
+    return {
+        "sensor_id": event.sensor_id,
+        "revision_id": event.revision_id,
+        "parent_id": event.parent_id,
+        "idempotency_key": event.idempotency_key,
+        "start_ns": event.start_ns,
+        "end_ns": event.end_ns,
+        "value": None if event.value is None else float(event.value),
+        "unit": event.unit,
+        "withdrawn": event.withdrawn,
+    }
+
+
+def build_seal_evidence(batch_id: str, store: BatchStore) -> dict:
+    """Deterministic sealable evidence of one batch.
+
+    Captures every stored revision (sorted by sensor then revision id, so
+    the document is independent of arrival order) plus the folded batch
+    result evaluated on the same snapshot. The document contains only plain
+    data, fully decoupled from the live store.
+    """
+    revisions = [
+        revision_to_dict(event)
+        for event in sorted(
+            store.events.values(), key=lambda e: (e.sensor_id, e.revision_id)
+        )
+    ]
+    return {
+        "batch_id": batch_id,
+        "revisions": revisions,
+        "result": evaluate_batch(batch_id, store),
+    }
+
+
+def hash_seal_evidence(evidence: dict) -> str:
+    """Stable SHA-256 over a seal evidence document.
+
+    Covers both the frozen revisions and the folded batch result, so the
+    digest changes exactly when the sealed evidence changes.
+    """
+    payload = json.dumps(
+        evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
